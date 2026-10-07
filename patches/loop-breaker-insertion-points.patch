@@ -1,0 +1,143 @@
+diff --git a/agent/agent_init.py b/agent/agent_init.py
+index 67fc38bf3f..f5a9a9828b 100644
+--- a/agent/agent_init.py
++++ b/agent/agent_init.py
+@@ -1751,6 +1751,19 @@ def init_agent(
+         )
+     except Exception as _tlg_err:
+         _ra().logger.warning("Tool loop guardrail config ignored: %s", _tlg_err)
++
++    # Loop circuit breaker (v2): no-new-information loop + session token ladder.
++    try:
++        from agent.loop_breaker import LoopBreaker, LoopBreakerConfig
++
++        agent._loop_breaker = LoopBreaker(
++            LoopBreakerConfig.from_mapping(_agent_cfg.get("loop_breaker", {}))
++        )
++        agent._loop_breaker_decision = None
++        agent._lb_nudge_pending = None
++    except Exception as _lb_err:
++        agent._loop_breaker = None
++        _ra().logger.warning("Loop breaker config ignored: %s", _lb_err)
+     # Cache only the derived auxiliary compression context override that is
+     # needed later by the startup feasibility check.  Avoid exposing a
+     # broad pseudo-public config object on the agent instance.
+diff --git a/agent/conversation_loop.py b/agent/conversation_loop.py
+index ea9e1ce264..58c1406472 100644
+--- a/agent/conversation_loop.py
++++ b/agent/conversation_loop.py
+@@ -1909,6 +1909,8 @@ def run_conversation(
+     while (api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0) or agent._budget_grace_call:
+         _redirect_text = agent._drain_pending_redirect()
+         if _redirect_text:
++            if getattr(agent, "_loop_breaker", None) is not None:
++                agent._loop_breaker.note_user_input()
+             _apply_active_turn_redirect(agent, messages, _redirect_text)
+             if isinstance(original_user_message, str):
+                 original_user_message = (
+@@ -1922,6 +1924,8 @@ def run_conversation(
+ 
+         # Check for interrupt request (e.g., user sent new message)
+         if agent._interrupt_requested:
++            if getattr(agent, "_loop_breaker", None) is not None:
++                agent._loop_breaker.note_user_input()
+             interrupted = True
+             _turn_exit_reason = "interrupted_by_user"
+             if not agent.quiet_mode:
+@@ -7203,6 +7207,34 @@ def run_conversation(
+ 
+                 agent._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
+ 
++                # --- Loop circuit breaker (v2): observe this step, then decide ---
++                if getattr(agent, "_loop_breaker", None) is not None:
++                    _lb_tool_names = [
++                        tc.function.name for tc in (assistant_message.tool_calls or [])
++                    ]
++                    agent._loop_breaker.observe_step(
++                        agent,
++                        agent._extract_reasoning(assistant_message),
++                        _lb_tool_names,
++                    )
++                    _lb_dec = agent._loop_breaker.check(agent)
++                    agent._loop_breaker_decision = (
++                        _lb_dec if _lb_dec.action != "ok" else None
++                    )
++                    if _lb_dec.action == "warn":
++                        if agent._loop_breaker.config.warnings_enabled:
++                            agent._emit_status(
++                                f"Loop breaker [{_lb_dec.code}]: {_lb_dec.message}"
++                            )
++                    elif _lb_dec.action == "nudge":
++                        agent._emit_status(
++                            f"Loop breaker nudge "
++                            f"{agent._loop_breaker.state.nudges}/"
++                            f"{agent._loop_breaker.config.nudges_before_halt} "
++                            f"[{_lb_dec.code}]"
++                        )
++                        agent._lb_nudge_pending = _lb_dec.message
++
+                 if getattr(agent, "_incremental_persistence_failed", False):
+                     # A tool result could not be made canonical. Do not send
+                     # the in-memory result back to the model or project any
+@@ -7212,6 +7244,25 @@ def run_conversation(
+                     failed = True
+                     break
+ 
++                if (
++                    getattr(agent, "_loop_breaker_decision", None) is not None
++                    and agent._loop_breaker_decision.should_halt
++                ):
++                    _lb = agent._loop_breaker_decision
++                    _turn_exit_reason = "loop_breaker_halt"
++                    final_response = _lb.message
++                    agent._emit_status(f"Loop breaker halted turn [{_lb.code}]")
++                    append_message(messages, {"role": "assistant", "content": final_response})
++                    if final_response:
++                        agent._safe_print(f"\n{final_response}\n")
++                        if agent.stream_delta_callback:
++                            try:
++                                agent.stream_delta_callback(final_response)
++                                agent.stream_delta_callback(None)
++                            except Exception:
++                                pass
++                    break
++
+                 if agent._tool_guardrail_halt_decision is not None:
+                     decision = agent._tool_guardrail_halt_decision
+                     _turn_exit_reason = "guardrail_halt"
+diff --git a/agent/turn_context.py b/agent/turn_context.py
+index a90bee9a1a..5d61f21332 100644
+--- a/agent/turn_context.py
++++ b/agent/turn_context.py
+@@ -581,6 +581,12 @@ def build_turn_context(
+     agent._unicode_sanitization_passes = 0
+     agent._tool_guardrails.reset_for_turn()
+     agent._tool_guardrail_halt_decision = None
++    # Loop breaker: fresh stall counter per turn; the token ladder is
++    # session-scoped and deliberately survives this reset.
++    if getattr(agent, "_loop_breaker", None) is not None:
++        agent._loop_breaker.reset_turn(agent)
++    agent._loop_breaker_decision = None
++    agent._lb_nudge_pending = None
+     _reset_consol = getattr(agent._memory_store, "reset_consolidation_failures", None)
+     if callable(_reset_consol):
+         _reset_consol()
+diff --git a/run_agent.py b/run_agent.py
+index b09262eae4..6a1436a5b3 100644
+--- a/run_agent.py
++++ b/run_agent.py
+@@ -8157,6 +8157,14 @@ class AIAgent:
+         )
+         if decision.action in {"warn", "halt"}:
+             function_result = append_toolguard_guidance(function_result, decision)
++        # Loop-breaker nudge rides the tool result: it reaches the model
++        # without touching the system prompt or adding a new message role.
++        _lb_nudge = getattr(self, "_lb_nudge_pending", None)
++        if _lb_nudge and not failed:
++            function_result = (function_result or "") + (
++                f"\n\n[Loop breaker] {_lb_nudge}"
++            )
++            self._lb_nudge_pending = None
+         if decision.should_halt:
+             self._set_tool_guardrail_halt(decision)
+         return function_result
